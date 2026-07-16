@@ -52,8 +52,8 @@ const PLAN_PRICE = { '1m': 150, '6m': 600, '12m': 1500 };
 // Возьмите shopId и secretKey в личном кабинете ЮKassa (Настройки → API).
 // Пока идёт проверка вашей заявки — там же доступны ТЕСТОВЫЕ ключи, можно
 // проверить всё на фальшивых картах уже сейчас.
-const YOOKASSA_SHOP_ID   = process.env.YOOKASSA_SHOP_ID;
-const YOOKASSA_SECRET_KEY = process.env.YOOKASSA_SECRET_KEY;
+const YOOKASSA_SHOP_ID    = (process.env.YOOKASSA_SHOP_ID || '').trim();
+const YOOKASSA_SECRET_KEY = (process.env.YOOKASSA_SECRET_KEY || '').trim();
 const YOOKASSA_AUTH = 'Basic ' + Buffer.from(`${YOOKASSA_SHOP_ID}:${YOOKASSA_SECRET_KEY}`).toString('base64');
 const SITE_URL = process.env.SITE_URL || 'https://the-codex.ru';
 
