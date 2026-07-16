@@ -48,6 +48,15 @@ function saveDb(db) {
 const PLAN_DAYS  = { '1m': 30, '6m': 183, '12m': 365 };
 const PLAN_PRICE = { '1m': 150, '6m': 600, '12m': 1500 };
 
+// ── ЮKassa: базовые настройки ────────────────────────────────────────────
+// Возьмите shopId и secretKey в личном кабинете ЮKassa (Настройки → API).
+// Пока идёт проверка вашей заявки — там же доступны ТЕСТОВЫЕ ключи, можно
+// проверить всё на фальшивых картах уже сейчас.
+const YOOKASSA_SHOP_ID   = process.env.YOOKASSA_SHOP_ID;
+const YOOKASSA_SECRET_KEY = process.env.YOOKASSA_SECRET_KEY;
+const YOOKASSA_AUTH = 'Basic ' + Buffer.from(`${YOOKASSA_SHOP_ID}:${YOOKASSA_SECRET_KEY}`).toString('base64');
+const SITE_URL = process.env.SITE_URL || 'https://the-codex.ru';
+
 // ── ПРОВЕРКА ЖИВОСТИ ────────────────────────────────────────────────────────
 // Открыть в браузере https://api.the-codex.ru/health — если видно "ok:true",
 // сервер и диск (запись файла) работают.
@@ -127,26 +136,119 @@ app.get('/check-subscription', asyncHandler(async (req, res) => {
   res.json({ ok: true, active, subscriptionUntil: user.subscriptionUntil });
 }));
 
-// ── ВЕБХУК ОТ ПЛАТЁЖКИ ─────────────────────────────────────────────────────
-// Провайдер (ЮKassa / Robokassa) стучится сюда сам после успешной оплаты.
-app.post('/webhook/payment', asyncHandler(async (req, res) => {
-  // ⚠️ ЗАМЕНИТЕ на реальную проверку подписи/источника вашей платёжки —
-  // без неё кто угодно сможет "продлить" себе подписку одним запросом.
-  if (!verifyWebhookSignature(req)) return res.status(400).send('bad signature');
-
-  const { login, plan, providerId, amount } = req.body || {};
-  const days = PLAN_DAYS[plan];
-  if (!login || !days) return res.status(400).send('bad payload');
+// ── ЛИЧНЫЙ КАБИНЕТ: полная информация об аккаунте ─────────────────────────
+app.post('/account', asyncHandler(async (req, res) => {
+  const { login, password } = req.body || {};
+  if (!login || !password) return res.status(400).json({ ok: false, error: 'Введите логин и пароль.' });
 
   const db = loadDb();
+  const user = db.users.find(u => u.login === login.toLowerCase());
+  if (!user) return res.status(401).json({ ok: false, error: 'Пользователь не найден.' });
+  const valid = await bcrypt.compare(password, user.passwordHash);
+  if (!valid) return res.status(401).json({ ok: false, error: 'Неверный пароль.' });
 
-  if (providerId && db.payments.some(p => p.providerId === providerId)) {
+  const active = !!user.subscriptionUntil && new Date(user.subscriptionUntil) > new Date();
+  const payments = db.payments
+    .filter(p => p.login === user.login)
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+  res.json({
+    ok: true,
+    login: user.login,
+    email: user.email,
+    createdAt: user.createdAt,
+    active,
+    subscriptionUntil: user.subscriptionUntil,
+    deviceLinked: !!user.deviceId,
+    payments
+  });
+}));
+
+// ── СОЗДАНИЕ ПЛАТЕЖА (ЮKassa) ─────────────────────────────────────────────
+// Фронтенд вызывает это, когда пользователь жмёт «Оплатить». Мы создаём
+// платёж на стороне ЮKassa и возвращаем ссылку, куда браузер должен перейти —
+// там ЮKassa сама покажет форму оплаты картой/СБП.
+app.post('/create-payment', asyncHandler(async (req, res) => {
+  if (!YOOKASSA_SHOP_ID || !YOOKASSA_SECRET_KEY) {
+    return res.status(503).json({ ok: false, error: 'Оплата ещё не подключена на сервере (нет ключей ЮKassa).' });
+  }
+  const { login, password, plan } = req.body || {};
+  const price = PLAN_PRICE[plan];
+  if (!login || !password || !price) {
+    return res.status(400).json({ ok: false, error: 'Проверьте логин, пароль и тариф.' });
+  }
+
+  // Платить может только владелец аккаунта — проверяем пароль тем же способом, что и при входе.
+  const db = loadDb();
+  const user = db.users.find(u => u.login === login.toLowerCase());
+  if (!user) return res.status(401).json({ ok: false, error: 'Пользователь не найден.' });
+  const valid = await bcrypt.compare(password, user.passwordHash);
+  if (!valid) return res.status(401).json({ ok: false, error: 'Неверный пароль.' });
+
+  const ykRes = await fetch('https://api.yookassa.ru/v3/payments', {
+    method: 'POST',
+    headers: {
+      'Authorization': YOOKASSA_AUTH,
+      'Content-Type': 'application/json',
+      'Idempotence-Key': crypto.randomUUID()
+    },
+    body: JSON.stringify({
+      amount: { value: price.toFixed(2), currency: 'RUB' },
+      capture: true,
+      confirmation: { type: 'redirect', return_url: `${SITE_URL}/?paid=1` },
+      description: `The Codex — тариф ${plan}`,
+      metadata: { login: login.toLowerCase(), plan }
+    })
+  });
+  const payment = await ykRes.json();
+  if (!ykRes.ok) {
+    return res.status(502).json({ ok: false, error: payment.description || 'ЮKassa отклонила запрос на оплату.' });
+  }
+
+  res.json({ ok: true, confirmationUrl: payment.confirmation.confirmation_url });
+}));
+
+
+// ── ВЕБХУК ОТ ЮKASSA ───────────────────────────────────────────────────────
+// ЮKassa стучится сюда сама после изменения статуса платежа (event:
+// "payment.succeeded"). Телу вебхука напрямую не доверяем — кто угодно может
+// прислать сюда поддельный POST. Вместо этого берём id платежа из уведомления
+// и переспрашиваем его статус напрямую у ЮKassa нашим secretKey — подделать
+// такой ответ снаружи невозможно.
+app.post('/webhook/payment', asyncHandler(async (req, res) => {
+  const notification = req.body || {};
+  const paymentId = notification.object && notification.object.id;
+  if (!paymentId) return res.status(400).send('bad payload');
+
+  // Не решаем по присланным данным — идём и спрашиваем у ЮKassa напрямую.
+  const checkRes = await fetch(`https://api.yookassa.ru/v3/payments/${paymentId}`, {
+    headers: { 'Authorization': YOOKASSA_AUTH }
+  });
+  const payment = await checkRes.json();
+  if (!checkRes.ok || payment.status !== 'succeeded') {
+    // Платёж ещё не подтверждён/отменён — ничего не продлеваем, просто отвечаем ОК,
+    // чтобы ЮKassa не повторяла вебхук бесконечно.
     return res.send('OK');
   }
 
-  const user = db.users.find(u => u.login === login.toLowerCase());
+  const login = payment.metadata && payment.metadata.login;
+  const plan  = payment.metadata && payment.metadata.plan;
+  const days  = PLAN_DAYS[plan];
+  if (!login || !days) return res.status(400).send('bad metadata');
+
+  const db = loadDb();
+
+  // Защита от повторной обработки одного и того же платежа — ЮKassa иногда
+  // присылает уведомление больше одного раза.
+  if (db.payments.some(p => p.providerId === paymentId)) {
+    return res.send('OK');
+  }
+
+  const user = db.users.find(u => u.login === login);
   if (!user) return res.status(404).send('user not found');
 
+  // Если подписка ещё активна — продлеваем ОТ ДАТЫ ОКОНЧАНИЯ, а не от "сейчас",
+  // чтобы досрочное продление не "сжигало" уже оплаченные дни.
   const base = (user.subscriptionUntil && new Date(user.subscriptionUntil) > new Date())
     ? new Date(user.subscriptionUntil)
     : new Date();
@@ -154,20 +256,15 @@ app.post('/webhook/payment', asyncHandler(async (req, res) => {
   user.subscriptionUntil = base.toISOString();
 
   db.payments.push({
-    login: login.toLowerCase(), plan,
-    amount: amount || PLAN_PRICE[plan] || 0,
-    providerId: providerId || crypto.randomUUID(),
+    login, plan,
+    amount: Number(payment.amount && payment.amount.value) || PLAN_PRICE[plan] || 0,
+    providerId: paymentId,
     createdAt: new Date().toISOString()
   });
   saveDb(db);
 
-  res.send('OK');
+  res.send('OK'); // ЮKassa ждёт 200 как подтверждение, что уведомление обработано
 }));
-
-function verifyWebhookSignature(req) {
-  // TODO: подставьте проверку под вашу платёжку.
-  return true;
-}
 
 // ── Обработчик 404 для неизвестных путей ────────────────────────────────────
 app.use((req, res) => {
