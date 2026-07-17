@@ -48,6 +48,19 @@ function saveDb(db) {
 const PLAN_DAYS  = { '1m': 30, '6m': 183, '12m': 365 };
 const PLAN_PRICE = { '1m': 150, '6m': 600, '12m': 1500 };
 
+// ── Постоянные сессии по токену ────────────────────────────────────────────
+// Чтобы не заставлять человека вводить пароль каждый раз, при успешном входе
+// выдаём случайный токен и сохраняем его у пользователя. Дальше сайт может
+// подтверждать личность токеном вместо пароля — токен живёт, пока не разлогинятся.
+function issueToken(user) {
+  user.token = crypto.randomUUID();
+  return user.token;
+}
+function findUserByToken(db, token) {
+  if (!token) return null;
+  return db.users.find(u => u.token === token) || null;
+}
+
 // ── ЮKassa: базовые настройки ────────────────────────────────────────────
 // Возьмите shopId и secretKey в личном кабинете ЮKassa (Настройки → API).
 // Пока идёт проверка вашей заявки — там же доступны ТЕСТОВЫЕ ключи, можно
@@ -84,17 +97,20 @@ app.post('/register', asyncHandler(async (req, res) => {
   }
 
   const passwordHash = await bcrypt.hash(password, 10);
-  db.users.push({
+  const user = {
     id: crypto.randomUUID(),
     login: loginLc,
     email: emailLc,
     passwordHash,
     deviceId: null,
+    token: null,
     subscriptionUntil: null,   // NULL = доступа к приложению ещё нет
     createdAt: new Date().toISOString()
-  });
+  };
+  issueToken(user);
+  db.users.push(user);
   saveDb(db);
-  res.json({ ok: true });
+  res.json({ ok: true, token: user.token, login: user.login });
 }));
 
 // ── ВХОД (main.js вызывает это вместо чтения локального users.json) ───────
@@ -137,15 +153,26 @@ app.get('/check-subscription', asyncHandler(async (req, res) => {
 }));
 
 // ── ЛИЧНЫЙ КАБИНЕТ: полная информация об аккаунте ─────────────────────────
+// Принимает ЛИБО { token } (постоянная сессия — не нужен пароль), ЛИБО
+// { login, password } (первый вход на новом устройстве/браузере).
 app.post('/account', asyncHandler(async (req, res) => {
-  const { login, password } = req.body || {};
-  if (!login || !password) return res.status(400).json({ ok: false, error: 'Введите логин и пароль.' });
-
+  const { login, password, token } = req.body || {};
   const db = loadDb();
-  const user = db.users.find(u => u.login === login.toLowerCase());
-  if (!user) return res.status(401).json({ ok: false, error: 'Пользователь не найден.' });
-  const valid = await bcrypt.compare(password, user.passwordHash);
-  if (!valid) return res.status(401).json({ ok: false, error: 'Неверный пароль.' });
+
+  let user = null;
+  if (token) {
+    user = findUserByToken(db, token);
+    if (!user) return res.status(401).json({ ok: false, error: 'Сессия истекла, войдите заново.' });
+  } else {
+    if (!login || !password) return res.status(400).json({ ok: false, error: 'Введите логин и пароль.' });
+    user = db.users.find(u => u.login === login.toLowerCase());
+    if (!user) return res.status(401).json({ ok: false, error: 'Пользователь не найден.' });
+    const valid = await bcrypt.compare(password, user.passwordHash);
+    if (!valid) return res.status(401).json({ ok: false, error: 'Неверный пароль.' });
+  }
+
+  issueToken(user); // продлеваем/выдаём токен при каждом успешном обращении
+  saveDb(db);
 
   const active = !!user.subscriptionUntil && new Date(user.subscriptionUntil) > new Date();
   const payments = db.payments
@@ -154,6 +181,7 @@ app.post('/account', asyncHandler(async (req, res) => {
 
   res.json({
     ok: true,
+    token: user.token,
     login: user.login,
     email: user.email,
     createdAt: user.createdAt,
@@ -164,6 +192,15 @@ app.post('/account', asyncHandler(async (req, res) => {
   });
 }));
 
+// ── ВЫХОД: аннулирует токен на сервере ────────────────────────────────────
+app.post('/logout', asyncHandler(async (req, res) => {
+  const { token } = req.body || {};
+  const db = loadDb();
+  const user = findUserByToken(db, token);
+  if (user) { user.token = null; saveDb(db); }
+  res.json({ ok: true });
+}));
+
 // ── СОЗДАНИЕ ПЛАТЕЖА (ЮKassa) ─────────────────────────────────────────────
 // Фронтенд вызывает это, когда пользователь жмёт «Оплатить». Мы создаём
 // платёж на стороне ЮKassa и возвращаем ссылку, куда браузер должен перейти —
@@ -172,18 +209,22 @@ app.post('/create-payment', asyncHandler(async (req, res) => {
   if (!YOOKASSA_SHOP_ID || !YOOKASSA_SECRET_KEY) {
     return res.status(503).json({ ok: false, error: 'Оплата ещё не подключена на сервере (нет ключей ЮKassa).' });
   }
-  const { login, password, plan } = req.body || {};
+  const { login, password, token, plan } = req.body || {};
   const price = PLAN_PRICE[plan];
-  if (!login || !password || !price) {
-    return res.status(400).json({ ok: false, error: 'Проверьте логин, пароль и тариф.' });
-  }
+  if (!price) return res.status(400).json({ ok: false, error: 'Неизвестный тариф.' });
 
-  // Платить может только владелец аккаунта — проверяем пароль тем же способом, что и при входе.
   const db = loadDb();
-  const user = db.users.find(u => u.login === login.toLowerCase());
-  if (!user) return res.status(401).json({ ok: false, error: 'Пользователь не найден.' });
-  const valid = await bcrypt.compare(password, user.passwordHash);
-  if (!valid) return res.status(401).json({ ok: false, error: 'Неверный пароль.' });
+  let user = null;
+  if (token) {
+    user = findUserByToken(db, token);
+    if (!user) return res.status(401).json({ ok: false, error: 'Сессия истекла, войдите заново.' });
+  } else {
+    if (!login || !password) return res.status(400).json({ ok: false, error: 'Проверьте логин и пароль.' });
+    user = db.users.find(u => u.login === login.toLowerCase());
+    if (!user) return res.status(401).json({ ok: false, error: 'Пользователь не найден.' });
+    const valid = await bcrypt.compare(password, user.passwordHash);
+    if (!valid) return res.status(401).json({ ok: false, error: 'Неверный пароль.' });
+  }
 
   const ykRes = await fetch('https://api.yookassa.ru/v3/payments', {
     method: 'POST',
@@ -197,7 +238,7 @@ app.post('/create-payment', asyncHandler(async (req, res) => {
       capture: true,
       confirmation: { type: 'redirect', return_url: `${SITE_URL}/?paid=1` },
       description: `The Codex — тариф ${plan}`,
-      metadata: { login: login.toLowerCase(), plan }
+      metadata: { login: user.login, plan }
     })
   });
   const payment = await ykRes.json();
