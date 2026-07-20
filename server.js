@@ -139,7 +139,13 @@ app.post('/login', asyncHandler(async (req, res) => {
       renewUrl: `https://the-codex.ru/#pricing`
     });
   }
-  res.json({ ok: true, subscriptionUntil: user.subscriptionUntil });
+
+  // Выдаём токен и приложению — пригодится для /logout и для будущих запросов
+  // из самого приложения (например, к /account), не пересылая пароль повторно.
+  const token = issueToken(user);
+  saveDb(db);
+
+  res.json({ ok: true, token, subscriptionUntil: user.subscriptionUntil });
 }));
 
 // ── ПРОВЕРКА ПОДПИСКИ (можно дёргать раз в час, пока оверлей открыт) ───────
