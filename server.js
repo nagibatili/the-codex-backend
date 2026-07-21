@@ -70,7 +70,57 @@ const YOOKASSA_SECRET_KEY = (process.env.YOOKASSA_SECRET_KEY || '').trim();
 const YOOKASSA_AUTH = 'Basic ' + Buffer.from(`${YOOKASSA_SHOP_ID}:${YOOKASSA_SECRET_KEY}`).toString('base64');
 const SITE_URL = process.env.SITE_URL || 'https://the-codex.ru';
 
-// ── ПРОВЕРКА ЖИВОСТИ ────────────────────────────────────────────────────────
+// ── EMAIL: подтверждение почты через Resend ────────────────────────────────
+// Resend — сервис отправки писем (resend.com), бесплатный лимит хватает для
+// старта. Возьмите API-ключ в личном кабинете Resend (Dashboard → API Keys)
+// и впишите его в переменные окружения на Railway.
+const RESEND_API_KEY = (process.env.RESEND_API_KEY || '').trim();
+// Пока не подтвердите свой домен в Resend, отправлять можно только с этого
+// служебного адреса — это ограничение Resend, а не наше. Как только домен
+// подтверждён (Resend → Domains → Add the-codex.ru), замените на
+// 'The Codex <noreply@the-codex.ru>'.
+const EMAIL_FROM = process.env.EMAIL_FROM || 'The Codex <onboarding@resend.dev>';
+
+async function sendVerificationEmail(email, code) {
+  if (!RESEND_API_KEY) {
+    console.warn(`[email] RESEND_API_KEY не задан — код для ${email}: ${code}`);
+    return { ok: false, error: 'Отправка почты не настроена на сервере (нет RESEND_API_KEY).' };
+  }
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        from: EMAIL_FROM,
+        to: [email],
+        subject: `Код подтверждения: ${code}`,
+        html: `
+          <div style="font-family:sans-serif;background:#05070d;color:#eef1f6;padding:32px;border-radius:14px">
+            <h2 style="color:#4ade80;margin:0 0 12px">The Codex</h2>
+            <p>Ваш код подтверждения e-mail:</p>
+            <p style="font-size:32px;font-weight:700;letter-spacing:6px;color:#d8b073">${code}</p>
+            <p style="color:#8a93a6;font-size:13px">Код действует 15 минут. Если вы не регистрировались на the-codex.ru — просто проигнорируйте это письмо.</p>
+          </div>`
+      })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      return { ok: false, error: err.message || 'Resend отклонил отправку письма.' };
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: 'Не удалось связаться с сервисом отправки почты.' };
+  }
+}
+
+function makeVerificationCode() {
+  return String(Math.floor(100000 + Math.random() * 900000)); // 6 цифр
+}
+
+
 // Открыть в браузере https://api.the-codex.ru/health — если видно "ok:true",
 // сервер и диск (запись файла) работают.
 app.get('/health', asyncHandler(async (req, res) => {
@@ -97,6 +147,7 @@ app.post('/register', asyncHandler(async (req, res) => {
   }
 
   const passwordHash = await bcrypt.hash(password, 10);
+  const code = makeVerificationCode();
   const user = {
     id: crypto.randomUUID(),
     login: loginLc,
@@ -104,13 +155,67 @@ app.post('/register', asyncHandler(async (req, res) => {
     passwordHash,
     deviceId: null,
     token: null,
+    emailVerified: false,
+    emailCode: code,
+    emailCodeExpires: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+    emailCodeSentAt: new Date().toISOString(),
     subscriptionUntil: null,   // NULL = доступа к приложению ещё нет
     createdAt: new Date().toISOString()
   };
   issueToken(user);
   db.users.push(user);
   saveDb(db);
-  res.json({ ok: true, token: user.token, login: user.login });
+
+  const mail = await sendVerificationEmail(user.email, code);
+  if (!mail.ok) console.warn('[register] письмо не отправлено:', mail.error);
+
+  res.json({ ok: true, token: user.token, login: user.login, emailSendError: mail.ok ? null : mail.error });
+}));
+
+// ── ПОДТВЕРЖДЕНИЕ ПОЧТЫ ────────────────────────────────────────────────────
+app.post('/verify-email', asyncHandler(async (req, res) => {
+  const { token, code } = req.body || {};
+  const db = loadDb();
+  const user = findUserByToken(db, token);
+  if (!user) return res.status(401).json({ ok: false, error: 'Сессия истекла, войдите заново.' });
+  if (user.emailVerified) return res.json({ ok: true, alreadyVerified: true });
+
+  if (!user.emailCode || !user.emailCodeExpires || new Date(user.emailCodeExpires) < new Date()) {
+    return res.status(400).json({ ok: false, error: 'Код истёк. Запросите новый.' });
+  }
+  if (String(code || '').trim() !== user.emailCode) {
+    return res.status(400).json({ ok: false, error: 'Неверный код.' });
+  }
+
+  user.emailVerified = true;
+  user.emailCode = null;
+  user.emailCodeExpires = null;
+  saveDb(db);
+  res.json({ ok: true });
+}));
+
+// ── ПОВТОРНАЯ ОТПРАВКА КОДА ─────────────────────────────────────────────────
+app.post('/resend-code', asyncHandler(async (req, res) => {
+  const { token } = req.body || {};
+  const db = loadDb();
+  const user = findUserByToken(db, token);
+  if (!user) return res.status(401).json({ ok: false, error: 'Сессия истекла, войдите заново.' });
+  if (user.emailVerified) return res.json({ ok: true, alreadyVerified: true });
+
+  // Не чаще одного письма в 60 секунд — чтобы не заспамить почту и не упереться в лимит Resend.
+  if (user.emailCodeSentAt && (Date.now() - new Date(user.emailCodeSentAt).getTime()) < 60000) {
+    return res.status(429).json({ ok: false, error: 'Подождите минуту перед повторной отправкой.' });
+  }
+
+  const code = makeVerificationCode();
+  user.emailCode = code;
+  user.emailCodeExpires = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+  user.emailCodeSentAt = new Date().toISOString();
+  saveDb(db);
+
+  const mail = await sendVerificationEmail(user.email, code);
+  if (!mail.ok) return res.status(502).json({ ok: false, error: mail.error });
+  res.json({ ok: true });
 }));
 
 // ── ВХОД (main.js вызывает это вместо чтения локального users.json) ───────
@@ -190,6 +295,7 @@ app.post('/account', asyncHandler(async (req, res) => {
     token: user.token,
     login: user.login,
     email: user.email,
+    emailVerified: !!user.emailVerified,
     createdAt: user.createdAt,
     active,
     subscriptionUntil: user.subscriptionUntil,
@@ -230,6 +336,10 @@ app.post('/create-payment', asyncHandler(async (req, res) => {
     if (!user) return res.status(401).json({ ok: false, error: 'Пользователь не найден.' });
     const valid = await bcrypt.compare(password, user.passwordHash);
     if (!valid) return res.status(401).json({ ok: false, error: 'Неверный пароль.' });
+  }
+
+  if (!user.emailVerified) {
+    return res.status(403).json({ ok: false, error: 'Подтвердите e-mail перед оплатой.', emailNotVerified: true });
   }
 
   const ykRes = await fetch('https://api.yookassa.ru/v3/payments', {
