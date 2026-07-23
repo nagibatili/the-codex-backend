@@ -338,10 +338,6 @@ app.post('/create-payment', asyncHandler(async (req, res) => {
     if (!valid) return res.status(401).json({ ok: false, error: 'Неверный пароль.' });
   }
 
-  if (!user.emailVerified) {
-    return res.status(403).json({ ok: false, error: 'Подтвердите e-mail перед оплатой.', emailNotVerified: true });
-  }
-
   const ykRes = await fetch('https://api.yookassa.ru/v3/payments', {
     method: 'POST',
     headers: {
