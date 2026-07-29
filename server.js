@@ -46,7 +46,7 @@ function saveDb(db) {
 }
 
 const PLAN_DAYS  = { '1m': 30, '6m': 183, '12m': 365 };
-const PLAN_PRICE = { '1m': 150, '6m': 600, '12m': 1500 };
+const PLAN_PRICE = { '1m': 200, '6m': 900, '12m': 1200 };
 
 // ── Постоянные сессии по токену ────────────────────────────────────────────
 // Чтобы не заставлять человека вводить пароль каждый раз, при успешном входе
@@ -419,7 +419,33 @@ app.post('/webhook/payment', asyncHandler(async (req, res) => {
   res.send('OK'); // ЮKassa ждёт 200 как подтверждение, что уведомление обработано
 }));
 
-// ── Обработчик 404 для неизвестных путей ────────────────────────────────────
+// ── СКАЧИВАНИЕ ПОСЛЕДНЕЙ ВЕРСИИ ПРИЛОЖЕНИЯ ──────────────────────────────────
+// Кнопка «Скачать лаунчер» на сайте ведёт СЮДА, а не прямо на .exe. Каждый
+// раз при сборке новой версии имя файла меняется (Setup 2.0.4.exe →
+// Setup 2.0.5.exe и т.д.) — вручную переклеивать ссылку на кнопке после
+// каждого релиза неудобно и легко забыть. Вместо этого сервер сам читает
+// тот же latest.yml, которым пользуется автообновление внутри приложения
+// (см. electron-updater / build.publish в package.json приложения), достаёт
+// оттуда имя актуального файла и переадресует браузер прямо на скачивание —
+// без промежуточных страниц и сторонних сайтов.
+const UPDATES_BASE_URL = (process.env.UPDATES_BASE_URL || 'https://the-codex.ru/updates').replace(/\/+$/, '');
+
+app.get('/download/windows', asyncHandler(async (req, res) => {
+  try {
+    const ymlRes = await fetch(`${UPDATES_BASE_URL}/latest.yml?t=${Date.now()}`); // ?t= — чтобы не отдавали закэшированную старую версию файла
+    if (!ymlRes.ok) throw new Error(`latest.yml недоступен (${ymlRes.status})`);
+    const yml = await ymlRes.text();
+    const match = yml.match(/^path:\s*(.+)$/m); // electron-builder всегда пишет строку "path: The Codex Setup X.Y.Z.exe"
+    if (!match) throw new Error('В latest.yml не найдено поле path');
+    const fileName = match[1].trim().replace(/^['"]|['"]$/g, '');
+    res.redirect(302, `${UPDATES_BASE_URL}/${encodeURIComponent(fileName)}`);
+  } catch (e) {
+    console.error('[download/windows]', e.message);
+    res.status(503).send('Не получилось найти последнюю версию установщика. Попробуйте позже или напишите в поддержку.');
+  }
+}));
+
+
 app.use((req, res) => {
   res.status(404).json({ ok: false, error: 'Такого маршрута нет.' });
 });
